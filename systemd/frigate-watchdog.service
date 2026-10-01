@@ -1,0 +1,7 @@
+[Unit]
+Description=Frigate NVR watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/frigate-watchdog
+TimeoutStartSec=150

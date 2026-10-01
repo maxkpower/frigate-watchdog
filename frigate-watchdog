@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""frigate-watchdog - checks Frigate every minute and alerts via Telegram and/or Signal.
+
+Checks:
+  ct      container running Frigate is not running
+  api     <FRIGATE_API>/api/stats not returning 200 JSON
+  cam:X   enabled camera X: no fresh recording segment in /tmp/cache,
+          or detect enabled and camera_fps == 0
+  probe   startup ffprobe hung (Frigate hangs on a dead stream when a camera
+          lacks detect width/height)
+
+  disk:X        a Frigate storage path is >= DISK_WARN_PCT full
+  detector:X    detector process missing, stuck on one detection, or slow (DETECTOR_MAX_MS)
+  skipped:X     camera has skipped frames for several checks (detector can't keep up)
+  restart-loop  Frigate restarted RESTART_LOOP_COUNT+ times in the last hour
+  log:X         Frigate log shows a fatal error, an error burst, or an ffmpeg crash loop
+  db            the Frigate SQLite database fails PRAGMA quick_check (checked daily)
+  mqtt          Frigate's retained frigate/available is not "online" on the broker
+
+Self-healing:
+  - a hung ffprobe older than PROBE_MAX_AGE is killed
+  - API down API_RESTART_AFTER checks in a row -> restart the frigate service,
+    at most once per RESTART_COOLDOWN
+
+Optional: IGNORE_CAMERAS=a,b skips known-offline cameras; HEARTBEAT_URL is pinged every
+successful run (dead-man switch for the case where this machine itself dies).
+
+Config: /etc/frigate-watchdog.conf (KEY=VALUE lines)
+State:  /var/lib/frigate-watchdog/state.json
+Test:   frigate-watchdog --dry    runs the checks, sends nothing, writes no state
+        frigate-watchdog --test   sends one test message on every channel
+"""
+import json, os, re, socket, struct, subprocess, sys, time, urllib.parse, urllib.request
+
+CONF_FILES = ["/etc/frigate-watchdog.conf"]
+STATE_FILE = "/var/lib/frigate-watchdog/state.json"
+
+
+def load_conf():
+    c = {}
+    for f in CONF_FILES:
+        try:
+            for line in open(f):
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    c[k.strip()] = v.strip().strip('"').strip("'")
+        except FileNotFoundError:
+            pass
+    return c
+
+
+C = load_conf()
+VMID = C.get("FRIGATE_VMID", "111")
+API = C.get("FRIGATE_API", "http://127.0.0.1:5000")
+CONFIRM = int(C.get("CONFIRM_CHECKS", "3"))          # consecutive bad checks before alerting
+REPEAT = int(C.get("REPEAT_SECONDS", "3600"))        # re-alert interval while still down
+SEGMENT_MAX_AGE = int(C.get("SEGMENT_MAX_AGE", "120"))
+PROBE_MAX_AGE = int(C.get("PROBE_MAX_AGE", "120"))
+API_RESTART_AFTER = int(C.get("API_RESTART_AFTER", "5"))
+RESTART_COOLDOWN = int(C.get("RESTART_COOLDOWN", "1800"))
+IGNORE = {c.strip() for c in C.get("IGNORE_CAMERAS", "").split(",") if c.strip()}
+DISK_WARN_PCT = float(C.get("DISK_WARN_PCT", "90"))
+DETECTOR_STUCK_SECONDS = int(C.get("DETECTOR_STUCK_SECONDS", "60"))
+DETECTOR_MAX_MS = float(C.get("DETECTOR_MAX_MS", "0"))          # 0 = off; set above your detector's normal speed
+RESTART_LOOP_COUNT = int(C.get("RESTART_LOOP_COUNT", "3"))
+LOG_FILE = C.get("LOG_FILE", "/dev/shm/logs/frigate/current")   # inside the container; "" disables the log scan
+LOG_BURST = int(C.get("LOG_BURST", "30"))                       # noisy-pattern hits per hour before alerting
+CRASH_PER_HOUR = int(C.get("CRASH_PER_HOUR", "30"))             # ffmpeg crashes per camera per hour
+LOG_HOLD = int(C.get("LOG_HOLD", "900"))                        # keep a fatal-log alert open this long (s)
+DB_CHECK = C.get("DB_CHECK", "1") == "1"
+DB_PATH = C.get("DB_PATH", "/config/frigate.db")
+DB_CHECK_INTERVAL = int(C.get("DB_CHECK_INTERVAL", "86400"))
+MQTT_HOST = C.get("MQTT_HOST", "")                              # empty disables the MQTT check
+DRY = "--dry" in sys.argv
+
+# Log lines that should never appear. Any hit raises an alert (held open for LOG_HOLD seconds).
+CRITICAL_LOG = [
+    ("fatal Python error", r"Fatal Python error"),
+    ("shared memory too small (bus error)", r"Bus error"),
+    ("database corrupt", r"database disk image is malformed"),
+    ("database locked", r"database is locked"),
+    ("no decoder surfaces", r"No decoder surfaces"),
+    ("corrupt recording segment", r"Discarding corrupt segment"),
+    ("no new recording segments", r"No new recording segments"),
+    ("disk full", r"No space left on device"),
+    ("illegal instruction (Coral driver / CPU)", r"Illegal instruction"),
+    ("config invalid (safe mode)", r"Starting in safe mode|Unable to start Frigate in safe mode"),
+    ("recording cache error", r"Error occurred when attempting to maintain recording cache"),
+]
+# Log lines that happen occasionally; only a burst (LOG_BURST per hour) is a problem.
+RATE_LOG = [
+    ("GPU surface sync failures", r"Failed to sync surface"),
+    ("non-monotonic timestamps", r"non[- ]monoton"),
+]
+CRASH_RE = re.compile(r"Ffmpeg process crashed unexpectedly for ([\w-]+)")
+
+
+def log(level, msg):
+    """syslog line. Format: frigate-watchdog: <LEVEL> <key>: <text>"""
+    # Under systemd stdout also lands in the journal, which would double every line.
+    if DRY or sys.stdout.isatty():
+        print(f"{level} {msg}")
+    if not DRY:
+        subprocess.run(["logger", "-t", "frigate-watchdog", "-p",
+                        {"DOWN": "user.crit", "RECOVERED": "user.notice"}.get(level, "user.warning"),
+                        f"{level} {msg}"])
+
+
+def sh(args, timeout=20, text=True):
+    try:
+        r = subprocess.run(args, capture_output=True, text=text, timeout=timeout)
+        return r.returncode, r.stdout
+    except subprocess.TimeoutExpired:
+        return 124, ("" if text else b"")
+
+
+def ct(cmd, timeout=20, text=True):
+    """Run a shell command inside the Frigate container (Proxmox LXC)."""
+    return sh(["pct", "exec", VMID, "--", "sh", "-c", cmd], timeout, text)
+
+
+def http_json(url, timeout=10):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.load(r) if r.status == 200 else None
+    except Exception:
+        return None
+
+
+def send_telegram(text):
+    tok, chat = C.get("TELEGRAM_BOT_TOKEN"), C.get("TELEGRAM_CHAT_ID")
+    if not (tok and chat):
+        return None  # channel not configured
+    data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+    try:
+        with urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/sendMessage", data, timeout=20) as r:
+            ok = json.load(r).get("ok")
+        return None if ok else "telegram: ok=false"
+    except Exception as e:
+        return f"telegram: {type(e).__name__}"
+
+
+def send_signal(text):
+    url, num, rcpt = C.get("SIGNAL_API"), C.get("SIGNAL_NUMBER"), C.get("SIGNAL_RECIPIENTS")
+    if not (url and num and rcpt):
+        return None  # channel not configured
+    body = json.dumps({"message": text, "number": num,
+                       "recipients": [r.strip() for r in rcpt.split(",") if r.strip()]}).encode()
+    req = urllib.request.Request(f"{url}/v2/send", body, {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return None if r.status in (200, 201) else f"signal: HTTP {r.status}"
+    except Exception as e:
+        return f"signal: {type(e).__name__}"
+
+
+def notify(text):
+    if DRY:
+        print("[dry] would send:\n" + text)
+        return
+    errs = [e for e in (send_telegram(text), send_signal(text)) if e]
+    for e in errs:
+        log("ERROR", f"delivery: {e}")
+
+
+def mqtt_available(host, port, user, pw, topic, client_id, timeout=5):
+    """Minimal MQTT 3.1.1 client: subscribe, read the retained message, return its payload (or None)."""
+    enc = lambda x: struct.pack("!H", len(x.encode())) + x.encode()
+
+    def pkt(first, body):
+        n, out = len(body), b""
+        while True:
+            d, n = n % 128, n // 128
+            out += bytes([d | (128 if n else 0)])
+            if not n:
+                return bytes([first]) + out + body
+
+    def rd(sock, n):
+        buf = b""
+        while len(buf) < n:
+            c = sock.recv(n - len(buf))
+            if not c:
+                raise EOFError
+            buf += c
+        return buf
+
+    def read_pkt(sock):
+        first, mult, ln = rd(sock, 1)[0], 1, 0
+        while True:
+            b = rd(sock, 1)[0]
+            ln += (b & 127) * mult
+            mult *= 128
+            if not b & 128:
+                return first, rd(sock, ln)
+
+    try:
+        end, sock = time.time() + timeout, socket.create_connection((host, port), timeout=timeout)
+        try:
+            flags = 0x02 | (0xC0 if user and pw else 0x80 if user else 0)
+            body = enc("MQTT") + bytes([4, flags]) + b"\x00\x1e" + enc(client_id)
+            body += (enc(user) if user else b"") + (enc(pw) if user and pw else b"")
+            sock.sendall(pkt(0x10, body))
+            t, p = read_pkt(sock)
+            if t >> 4 != 2 or p[1] != 0:
+                return None  # connection refused (bad credentials, not authorised)
+            sock.sendall(pkt(0x82, b"\x00\x01" + enc(topic) + b"\x00"))
+            while time.time() < end:
+                sock.settimeout(max(0.1, end - time.time()))
+                t, p = read_pkt(sock)
+                if t >> 4 == 3:  # PUBLISH: the retained message arrives right after SUBACK
+                    off = 2 + struct.unpack("!H", p[:2])[0] + (2 if (t >> 1) & 3 else 0)
+                    return p[off:].decode("utf-8", "replace")
+            return None
+        finally:
+            try:
+                sock.sendall(b"\xe0\x00")
+            except Exception:
+                pass
+            sock.close()
+    except Exception:
+        return None
+
+
+def storage_problems(stats, warn_pct):
+    """Frigate reports storage in MB under service.storage. Paths on one device repeat the same numbers."""
+    out, seen = {}, set()
+    for path, s in (stats.get("service", {}).get("storage") or {}).items():
+        total, used = s.get("total") or 0, s.get("used") or 0
+        if not total or (total, used) in seen:
+            continue
+        seen.add((total, used))
+        pct = 100.0 * used / total
+        if pct >= warn_pct:
+            out[f"disk:{path}"] = f"storage {path} is {pct:.0f}% full ({(total - used) / 1024:.1f} GB free)"
+    return out
+
+
+def detector_problems(stats, now, stuck_s, max_ms):
+    """detection_fps is 0 when nothing moves, so it says nothing. Use the process, the in-flight timer and speed."""
+    out = {}
+    for name, d in (stats.get("detectors") or {}).items():
+        start = d.get("detection_start") or 0
+        if not d.get("pid"):
+            out[f"detector:{name}"] = f"detector {name} has no running process"
+        elif start and now - start > stuck_s:
+            out[f"detector:{name}"] = f"detector {name} has been stuck on one detection for {int(now - start)} s"
+        elif max_ms and (d.get("inference_speed") or 0) > max_ms:
+            out[f"detector:{name}"] = f"detector {name} is slow: {d['inference_speed']:.0f} ms per inference (limit {max_ms:.0f})"
+    return out
+
+
+def skipped_problems(stats, cfg, ignore):
+    """Skipped frames mean the detector can't keep up. Needs CONFIRM_CHECKS bad checks in a row to alert."""
+    out = {}
+    for name, cs in (stats.get("cameras") or {}).items():
+        if name in ignore or not cfg.get("cameras", {}).get(name, {}).get("enabled", True):
+            continue
+        if (cs.get("skipped_fps") or 0) > 0:
+            out[f"skipped:{name}"] = f"camera {name}: detector is skipping frames ({cs['skipped_fps']:.1f} fps skipped)"
+    return out
+
+
+def restart_problems(state, uptime, now, loop_count, window=3600):
+    """service.uptime is seconds since Frigate started; a drop between runs means it restarted."""
+    prev, state["uptime"] = state.get("uptime"), uptime
+    hist = [t for t in state.get("restarts", []) if now - t < window]
+    if prev is not None and uptime < prev:
+        hist.append(now)
+    state["restarts"] = hist
+    if len(hist) >= loop_count:
+        return {"restart-loop": f"Frigate restarted {len(hist)} times in the last hour"}
+    return {}
+
+
+def scan_log_text(text, ignore):
+    """Return [(kind, key, count)] for fatal lines, noisy patterns and per-camera ffmpeg crashes."""
+    hits = []
+    for label, rx in CRITICAL_LOG:
+        n = len(re.findall(rx, text))
+        if n:
+            hits.append(("crit", label, n))
+    for label, rx in RATE_LOG:
+        n = len(re.findall(rx, text, re.I))
+        if n:
+            hits.append(("rate", label, n))
+    crashes = {}
+    for cam in CRASH_RE.findall(text):
+        if cam not in ignore:
+            crashes[cam] = crashes.get(cam, 0) + 1
+    hits += [("crash", cam, n) for cam, n in crashes.items()]
+    return hits
+
+
+def log_problems(state, now, burst, crash_per_hour, hold):
+    """Turn the last hour of log hits (state['loghist']) into problems."""
+    hist = [e for e in state.get("loghist", []) if now - e[0] < 3600]
+    state["loghist"] = hist
+    out, rate, crash = {}, {}, {}
+    for ts, kind, key, n in hist:
+        if kind == "crit" and now - ts < hold:
+            out[f"log:{key}"] = f"Frigate log reports: {key}"
+        elif kind == "rate":
+            rate[key] = rate.get(key, 0) + n
+        elif kind == "crash":
+            crash[key] = crash.get(key, 0) + n
+    for key, n in rate.items():
+        if n >= burst:
+            out[f"log:{key}"] = f"Frigate log: {key} ({n} in the last hour)"
+    for cam, n in crash.items():
+        if n >= crash_per_hour:
+            out[f"log:crash:{cam}"] = f"camera {cam}: ffmpeg crashed {n} times in the last hour"
+    return out
+
+
+def scan_log(state, now):
+    """Read what Frigate logged since the last run (first run starts at the end, so old history never alerts)."""
+    rc, out = ct(f"stat -c '%s %i' {LOG_FILE}")
+    try:
+        size, ino = (int(x) for x in out.split())
+    except ValueError:
+        return
+    st = state.setdefault("log", {})
+    if "ino" not in st:
+        off = size                      # first run
+    elif st["ino"] != ino or st["off"] > size:
+        off = 0                         # log was replaced or truncated
+    else:
+        off = st["off"]
+    raw = b""
+    if off < size:
+        rc, raw = ct(f"tail -c +{off + 1} {LOG_FILE} | head -c 5000000", 30, text=False)
+    st["ino"], st["off"] = ino, off + len(raw)
+    hist = state.setdefault("loghist", [])
+    hist.extend([now, kind, key, n] for kind, key, n in scan_log_text(raw.decode("utf-8", "replace"), IGNORE))
+
+
+def db_check(state, now):
+    """Daily read-only SQLite quick_check of the Frigate database, run inside the container."""
+    if now - state.get("db_checked", 0) >= DB_CHECK_INTERVAL:
+        py = ("import sqlite3;c=sqlite3.connect('file:%s?mode=ro',uri=True);"
+              "print(c.execute('PRAGMA quick_check').fetchone()[0])" % DB_PATH)
+        rc, out = ct(f'python3 -c "{py}"', 60)
+        res = out.strip()
+        if not DRY and res:
+            state["db_checked"], state["db_result"] = now, res
+    else:
+        res = state.get("db_result", "")
+    if res and res != "ok":
+        return {"db": f"Frigate database failed its integrity check: {res[:120]}"}
+    return {}
+
+
+def mqtt_check():
+    """Frigate publishes a retained 'online'/'offline' on <prefix>/available. If the broker link is down, HA alerts stop silently."""
+    val = mqtt_available(MQTT_HOST, int(C.get("MQTT_PORT", "1883")), C.get("MQTT_USER"), C.get("MQTT_PASS"),
+                         C.get("MQTT_TOPIC", "frigate/available"), f"frigate-watchdog-{os.getpid()}")
+    if val == "online":
+        return {}
+    why = "broker unreachable, login refused or no availability message" if val is None else f"Frigate reports '{val}'"
+    return {"mqtt": f"MQTT link to {MQTT_HOST}: {why} - detection alerts via MQTT may not arrive"}
+
+
+def check(state):
+    """Return {key: description} of current problems. Performs self-healing."""
+    problems = {}
+    rc, out = sh(["pct", "status", VMID])
+    if "running" not in out:
+        return {"ct": f"CT{VMID} is not running ({out.strip() or 'pct status failed'})"}
+
+    # Hung startup ffprobe (etimes = seconds since start)
+    rc, out = ct("ps -eo pid=,etimes=,args= | grep '[f]fprobe'")
+    for line in out.splitlines():
+        pid, age, args = line.split(None, 2)
+        if int(age) > PROBE_MAX_AGE and "-timeout" not in args:
+            problems["probe"] = f"Frigate startup was hung on ffprobe for {int(age)//60} min ({args.split()[-1]}); killed it"
+            if not DRY:
+                ct(f"kill {pid}")
+                log("REMEDIATION", f"probe: killed hung ffprobe pid {pid} age {age}s")
+
+    now = time.time()
+    if LOG_FILE:
+        scan_log(state, now)
+        problems.update(log_problems(state, now, LOG_BURST, CRASH_PER_HOUR, LOG_HOLD))
+    if DB_CHECK:
+        problems.update(db_check(state, now))
+    if MQTT_HOST:
+        problems.update(mqtt_check())
+
+    stats = http_json(f"{API}/api/stats")
+    cfg = http_json(f"{API}/api/config") if stats else None
+    if not stats or not cfg:
+        problems["api"] = "Frigate API not responding - NVR is not recording"
+        n = state.setdefault("api_fail", 0) + 1
+        state["api_fail"] = n
+        if n >= API_RESTART_AFTER and time.time() - state.get("last_restart", 0) > RESTART_COOLDOWN:
+            state["last_restart"] = time.time()
+            problems["api"] += f"; auto-restarted frigate after {n} min"
+            if not DRY:
+                ct("systemctl restart frigate", 60)
+                log("REMEDIATION", f"api: restarted frigate service after {n} failed checks")
+        return problems
+    state["api_fail"] = 0
+    problems.update(storage_problems(stats, DISK_WARN_PCT))
+    problems.update(detector_problems(stats, time.time(), DETECTOR_STUCK_SECONDS, DETECTOR_MAX_MS))
+    problems.update(skipped_problems(stats, cfg, IGNORE))
+    problems.update(restart_problems(state, stats.get("service", {}).get("uptime") or 0, time.time(), RESTART_LOOP_COUNT))
+
+    # Newest recording segment per camera in /tmp/cache (files: <cam>@<ts>.mp4)
+    rc, out = ct("date +%s; cd /tmp/cache 2>/dev/null && stat -c '%n %Y' -- *@*.mp4 2>/dev/null")
+    lines = out.splitlines()
+    now = int(lines[0]) if lines and lines[0].strip().isdigit() else int(time.time())
+    newest = {}
+    for line in lines[1:]:
+        parts = line.rsplit(" ", 1)
+        if len(parts) == 2 and "@" in parts[0] and parts[1].isdigit():
+            cam = parts[0].split("@", 1)[0]
+            newest[cam] = max(newest.get(cam, 0), int(parts[1]))
+
+    for name, cc in cfg.get("cameras", {}).items():
+        if not cc.get("enabled", True) or name in IGNORE:
+            continue
+        cs = stats["cameras"].get(name, {})
+        why = []
+        if cc.get("record", {}).get("enabled"):
+            age = now - newest[name] if name in newest else None
+            if age is None or age > SEGMENT_MAX_AGE:
+                why.append("not recording" + (f" (last segment {age//60} min ago)" if age else ""))
+        if cc.get("detect", {}).get("enabled") and not cs.get("camera_fps"):
+            why.append("0 fps")
+        if why:
+            problems[f"cam:{name}"] = f"camera {name}: " + ", ".join(why)
+    return problems
+
+
+def main():
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    if "--test" in sys.argv:
+        notify("✅ frigate-watchdog test message. Delivery OK if you see this on every configured channel.")
+        log("TEST", "test: test message sent")
+        return
+    try:
+        state = json.load(open(STATE_FILE))
+    except Exception:
+        state = {}
+    issues = state.setdefault("issues", {})  # key -> {first, count, alerted, last_alert, text}
+    now = time.time()
+
+    problems = check(state)
+    new_alerts, recovered = [], []
+
+    for key, text in problems.items():
+        i = issues.setdefault(key, {"first": now, "count": 0, "alerted": False, "last_alert": 0})
+        i["count"] += 1
+        i["text"] = text
+        confirm = 1 if key in ("probe", "ct", "db", "restart-loop") or key.startswith("log:") else CONFIRM
+        if i["count"] >= confirm and (not i["alerted"] or now - i["last_alert"] > REPEAT):
+            mins = int((now - i["first"]) / 60)
+            new_alerts.append(f"• {text}" + (f" (for {mins} min)" if i["alerted"] else ""))
+            log("DOWN", f"{key}: {text}")
+            i["alerted"], i["last_alert"] = True, now
+
+    for key in list(issues):
+        if key not in problems:
+            i = issues.pop(key)
+            if i.get("alerted"):
+                mins = int((now - i["first"]) / 60)
+                recovered.append(f"• {key.replace('cam:', 'camera ')} OK again (was down {mins} min)")
+                log("RECOVERED", f"{key}: recovered after {mins} min")
+
+    msg = []
+    if new_alerts:
+        msg.append("🚨 FRIGATE ALERT - cameras\n" + "\n".join(new_alerts))
+    if recovered:
+        msg.append("✅ Frigate recovered\n" + "\n".join(recovered))
+    if msg:
+        notify("\n\n".join(msg))
+    if DRY:
+        print("problems:", json.dumps(problems, indent=1))
+    else:
+        tmp = STATE_FILE + ".tmp"
+        json.dump(state, open(tmp, "w"), indent=1)
+        os.replace(tmp, STATE_FILE)
+        if C.get("HEARTBEAT_URL"):      # dead-man switch: the monitor alerts if these pings stop
+            try:
+                urllib.request.urlopen(C["HEARTBEAT_URL"], timeout=10).close()
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    main()

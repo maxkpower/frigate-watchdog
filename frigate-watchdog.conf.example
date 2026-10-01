@@ -1,0 +1,35 @@
+# Copy to /etc/frigate-watchdog.conf, then: chmod 600 and chown root.
+# Never commit or share the filled-in copy.
+
+# Frigate
+FRIGATE_VMID=111
+FRIGATE_API=http://FRIGATE_IP:5000
+
+# Telegram (optional - leave out to disable)
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# Signal via signal-cli-rest-api (optional - leave out to disable)
+SIGNAL_API=http://SIGNAL_API_HOST:8080
+SIGNAL_NUMBER=
+SIGNAL_RECIPIENTS=
+
+# Optional
+# IGNORE_CAMERAS=garage,spare_cam
+# MQTT_HOST=BROKER_IP
+# MQTT_PORT=1883
+# MQTT_USER=
+# MQTT_PASS=
+# HEARTBEAT_URL=https://hc-ping.com/YOUR_ID
+# DETECTOR_MAX_MS=50
+# DISK_WARN_PCT=90
+# LOG_BURST=30
+# CRASH_PER_HOUR=30
+
+# Tuning (defaults shown)
+CONFIRM_CHECKS=3
+REPEAT_SECONDS=3600
+SEGMENT_MAX_AGE=120
+PROBE_MAX_AGE=120
+API_RESTART_AFTER=5
+RESTART_COOLDOWN=1800
